@@ -1,0 +1,393 @@
+# ============================================================================
+#  K60(mondrian) / 通用 Android12-5.10 GKI 内核编译
+#  思路来自 Celestials316/Build-your-own-kernel：不再手搓 make gki_defconfig，
+#  而是 repo 拉官方 manifest + 用 ACK 自带 build/build.sh 编，信息自然对齐：
+#    · 工具链(5.10 官方是 clang-r416183b / Clang 12.0.5，不是 r510928)
+#    · LTO=thin + CFI 模式
+#    · KMI 符号表 / defconfig fragment / module 签名策略
+#  产物：AnyKernel3 刷机包（只替换 boot.img 里的 Image，ramdisk/cmdline/dtb 全用设备原值）
+#
+#  实测参考：同一套流程在 5.10 LTS 上可开机（K60，SukiSU Ultra）
+# ============================================================================
+name: K60-5.10-GKI
+
+permissions:
+  contents: write
+
+concurrency:
+  group: k60-5.10-${{ github.ref }}-${{ github.event.inputs.variant }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: '集成内容（首次验证请选 stock，确认能开机后再加 SukiSU）'
+        required: true
+        type: choice
+        default: 'stock'
+        options:
+          - 'stock'
+          - 'sukisu'
+          - 'sukisu_susfs'
+      os_patch_level:
+        description: 'manifest 分支（lts = common-android12-5.10-lts，最新 5.10；其余为对应 GKI 发布）'
+        required: true
+        type: choice
+        default: 'lts'
+        options:
+          - 'lts'
+          - '2025-02'
+          - '2024-11'
+          - '2024-08'
+      version_suffix:
+        description: '自定义版本串后缀(uname -r 的后半段)，留空=保留源码默认（只去掉 -dirty）'
+        required: false
+        type: string
+        default: ''
+      use_zram:
+        description: '打 lz4kd/zram 补丁（默认关，它会额外改 defconfig 与模块清单，先跑通再说）'
+        required: true
+        type: boolean
+        default: false
+      use_kpm:
+        description: 'KPM 修补（编译后用 SukiSU_patch 的 patch_linux 处理 Image）'
+        required: true
+        type: boolean
+        default: false
+      upload_release:
+        description: '是否上传到 Release'
+        required: true
+        type: boolean
+        default: false
+
+env:
+  BRANCH: android12-5.10
+  KVER: '5.10'
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPILERCHECK: '%compiler% -dumpmachine; %compiler% -dumpversion'
+  CCACHE_NOHASHDIR: 'true'
+  CCACHE_HARDLINK: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      artifact_name: ${{ steps.pack.outputs.name }}
+      kernel_release: ${{ steps.pack.outputs.release }}
+
+    steps:
+      - name: 解析参数
+        id: info
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/kernel_5.10"
+          if [ "${{ inputs.os_patch_level }}" = "lts" ]; then
+            MANIFEST="common-android12-5.10-lts"
+          else
+            MANIFEST="common-android12-5.10-${{ inputs.os_patch_level }}"
+          fi
+          echo "KERNEL_SRC_ROOT=$SRC" >> $GITHUB_ENV
+          echo "MANIFEST_BRANCH=$MANIFEST" >> $GITHUB_ENV
+          echo "GKI_DEFCONFIG=$SRC/common/arch/arm64/configs/gki_defconfig" >> $GITHUB_ENV
+
+          # 版本串：留空则沿用源码自己的（后面只清 -dirty）
+          SUFFIX="${{ inputs.version_suffix }}"
+          if [ -z "$SUFFIX" ]; then
+            SUFFIX="-android12-9-g$(head /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | head -c 11)-ab$(head /dev/urandom | LC_ALL=C tr -dc '0-9' | head -c 8)"
+            echo "未填版本后缀，自动生成仿官方串：$SUFFIX"
+          fi
+          echo "FINAL_SUFFIX=$SUFFIX" >> $GITHUB_ENV
+          echo "manifest=$MANIFEST" >> $GITHUB_STEP_SUMMARY
+          echo "variant=${{ inputs.variant }}" >> $GITHUB_STEP_SUMMARY
+
+      # 必须最先做：它会挂新卷覆盖 $GITHUB_WORKSPACE，任何已经 clone 的东西都会消失
+      - name: 释放磁盘空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            ccache python3 python3-pip git curl time libssl-dev flex bison zip unzip rsync
+          git config --global user.name  "github-actions"
+          git config --global user.email "github-actions@github.com"
+          ccache --max-size=${CCACHE_MAXSIZE} || true
+          ccache --set-config=compression=true || true
+
+      - name: 还原 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: k60-ccache-${{ env.BRANCH }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}
+          restore-keys: |
+            k60-ccache-${{ env.BRANCH }}-${{ inputs.os_patch_level }}-
+            k60-ccache-${{ env.BRANCH }}-
+
+      - name: 安装 repo
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/git-repo"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod a+rx "$GITHUB_WORKSPACE/git-repo/repo"
+          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
+
+      - name: 克隆辅助仓库(AnyKernel3 / SUSFS / SukiSU_patch)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/WildPlusKernel/AnyKernel3.git -b gki-2.0 AnyKernel3
+          if [ "${{ inputs.variant }}" = "sukisu_susfs" ]; then
+            git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git -b gki-android12-5.10 susfs4ksu \
+              || { echo "::error::susfs4ksu 的 gki-android12-5.10 分支拉取失败"; exit 1; }
+          fi
+          git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git SukiSU_patch
+
+      - name: 同步内核源码(repo init + sync)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          retry_on: timeout
+          command: |
+            set -euo pipefail
+            mkdir -p "$KERNEL_SRC_ROOT"
+            cd "$KERNEL_SRC_ROOT"
+            "$REPO" init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+              -b "$MANIFEST_BRANCH" --repo-rev=v2.16
+            # ACK 老分支会被挪到 deprecated/ 下，manifest 里不改就 sync 不到
+            MF=".repo/manifests/default.xml"
+            [ -f "$MF" ] || MF=".repo/manifest.xml"
+            REV=$(grep 'project path="common"' "$MF" | sed -n 's/.*revision="\([^"]*\)".*/\1/p' | head -n1 || true)
+            [ -n "$REV" ] || REV="$MANIFEST_BRANCH"
+            echo "common revision = $REV"
+            if git ls-remote https://android.googlesource.com/kernel/common | grep -q "refs/heads/deprecated/$REV"; then
+              echo "分支已归档，切到 deprecated/$REV"
+              sed -i "/project path=\"common\"/s|revision=\"$REV\"|revision=\"deprecated/$REV\"|" "$MF"
+            fi
+            "$REPO" sync -c -j"$(nproc --all)" --no-tags --fail-fast --current-branch
+
+      - name: 校验源码与工具链
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC_ROOT"
+          test -d common                 || { echo "::error::没有 common/，manifest 拉取不完整"; exit 1; }
+          test -f build/build.sh         || { echo "::error::没有 build/build.sh，这个 manifest 不是 5.x 分支"; exit 1; }
+          test -f common/build.config.gki.aarch64 || { echo "::error::缺少 build.config.gki.aarch64"; exit 1; }
+          echo "--- Makefile 版本 ---"; sed -n '1,5p' common/Makefile
+          echo "--- 自带 clang ---"
+          ls -d prebuilts/clang/host/linux-x86/*/ 2>/dev/null | head -5 || true
+          CLANG_DIR=$(ls -d prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | head -1 || true)
+          if [ -n "$CLANG_DIR" ]; then
+            echo "CLANG_BIN=$KERNEL_SRC_ROOT/$CLANG_DIR/bin" >> $GITHUB_ENV
+            "$KERNEL_SRC_ROOT/$CLANG_DIR/bin/clang" --version | head -2 || true
+          else
+            echo "::warning::manifest 里没看到 prebuilts/clang，交给 build.sh 自己找工具链"
+          fi
+
+      - name: 集成 SukiSU
+        if: inputs.variant != 'stock'
+        working-directory: ${{ env.KERNEL_SRC_ROOT }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh \
+            | bash -s susfs-test
+          test -d KernelSU || { echo "::error::SukiSU setup 没有生成 KernelSU/ 目录"; exit 1; }
+          echo "SukiSU: $(cd KernelSU && (git describe --tags --long 2>/dev/null || git rev-parse --short HEAD))"
+
+      - name: 应用 SUSFS
+        if: inputs.variant == 'sukisu_susfs'
+        working-directory: ${{ env.KERNEL_SRC_ROOT }}
+        run: |
+          set -euo pipefail
+          P="../susfs4ksu/kernel_patches"
+          cp "$P/50_add_susfs_in_gki-android12-5.10.patch" ./common/
+          cp -r "$P/fs/." ./common/fs/
+          cp -r "$P/include/linux/." ./common/include/linux/
+          cd common
+          # 注意：这里不要用 --batch 也不吞错误，SUSFS 打一半等于报废
+          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+
+      - name: 写入配置项
+        run: |
+          set -euo pipefail
+          CFG="$GKI_DEFCONFIG"
+          test -f "$CFG" || { echo "::error::找不到 gki_defconfig"; exit 1; }
+          setcfg() {
+            sed -i -e "/^$1=/d" -e "/^# $1 is not set/d" "$CFG"
+            echo "$1=$2" >> "$CFG"
+          }
+          if [ "${{ inputs.variant }}" != "stock" ]; then
+            for k in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_TMPFS_XATTR CONFIG_TMPFS_POSIX_ACL; do setcfg "$k" y; done
+          fi
+          if [ "${{ inputs.variant }}" = "sukisu_susfs" ]; then
+            for k in CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT CONFIG_KSU_SUSFS_SUS_PATH \
+                     CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+                     CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
+                     CONFIG_KSU_SUSFS_TRY_UMOUNT CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+                     CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_ENABLE_LOG \
+                     CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                     CONFIG_KSU_SUSFS_OPEN_REDIRECT; do setcfg "$k" y; done
+            for k in CONFIG_KSU_SUSFS_SUS_SU CONFIG_KSU_SUSFS_SUS_OVERLAYFS; do setcfg "$k" n; done
+          fi
+          if [ "${{ inputs.use_zram }}" = "true" ]; then
+            setcfg CONFIG_ZSMALLOC y
+            setcfg CONFIG_ZRAM y
+            # 5.10 上必须关模块签名，否则厂商签名与自家 key 冲突
+            setcfg CONFIG_MODULE_SIG n
+          fi
+          sort -u "$CFG" -o "$CFG"
+
+      - name: 设置版本串
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC_ROOT"
+          CFG="$GKI_DEFCONFIG"
+          SLS="./common/scripts/setlocalversion"
+
+          # defconfig 里的 LOCALVERSION 会与本步骤打架，先清空
+          sed -i '/^CONFIG_LOCALVERSION=/d;/^# CONFIG_LOCALVERSION_AUTO is not set/d' "$CFG"
+          echo 'CONFIG_LOCALVERSION=""' >> "$CFG"
+          sed -i '/^CONFIG_LOCALVERSION_AUTO=/d' "$CFG"
+          echo '# CONFIG_LOCALVERSION_AUTO is not set' >> "$CFG"
+
+          # 让 scripts/setlocalversion 只回显固定串，保证 uname -r 可预期、不带 -dirty
+          if [ -n "${FINAL_SUFFIX:-}" ]; then
+            printf '#!/bin/sh\necho "%s"\n' "$FINAL_SUFFIX" > "$SLS"
+          else
+            sed -i 's/-dirty//g' "$SLS"
+          fi
+          chmod +x "$SLS"
+
+          # 改过 defconfig 后，build.sh 的一致性检查会直接判失败
+          for f in common/build.config common/build.config.gki common/build.config.gki.aarch64; do
+            [ -f "$f" ] && sed -i 's/check_defconfig//g' "$f"
+          done
+
+      - name: 编译内核(build.sh)
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC_ROOT"
+          NOW=$(date +%s)
+          LOG="$GITHUB_WORKSPACE/build.log"
+          : > "$LOG"
+          echo "预算 200 分钟，超时先落盘日志与 ccache，别等平台 360 分钟硬杀"
+
+          set +e
+          {
+            timeout --signal=INT --kill-after=180 12000 \
+              env LTO=thin \
+                  SYSTEM_DLKM_RE_SIGN=0 \
+                  BUILD_SYSTEM_DLKM=0 \
+                  KMI_SYMBOL_LIST_STRICT_MODE=0 \
+                  BUILD_CONFIG=common/build.config.gki.aarch64 \
+                  CC="/usr/bin/ccache clang" \
+                  ./build/build.sh
+          } 2>&1 | while IFS= read -r line; do
+            printf '[+%02d:%02d] %s\n' $(( (SECONDS)/60 )) $(( (SECONDS)%60 )) "$line"
+          done | tee -a "$LOG"
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$RC" -eq 124 ] || [ "$RC" -eq 130 ]; then
+            echo "::error::编译被 200 分钟预算中断（rc=$RC），日志已保存为工件；ccache 也已保留，重跑可续"
+            exit 1
+          elif [ "$RC" -ne 0 ]; then
+            echo "::error::编译失败（rc=$RC），日志见 build.log 工件"
+            grep -nE "error:|Error [0-9]|undefined" "$LOG" | head -30 || true
+            exit 1
+          fi
+          echo "编译完成，用时 $(( ($(date +%s)-NOW)/60 )) 分钟"
+
+      - name: KPM 修补
+        if: inputs.use_kpm
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC_ROOT"
+          IMG=$(ls out/android12-5.10/dist/Image 2>/dev/null || find out -maxdepth 6 -name Image -type f | head -1)
+          test -n "$IMG" || { echo "::error::找不到 Image"; exit 1; }
+          cd "$(dirname "$IMG")"
+          curl -fsSL https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux -o pk
+          chmod +x pk
+          ./pk || { echo "::warning::KPM 修补失败，保留未修补的 Image"; }
+          if [ -f oImage ]; then mv Image Image.orig; mv oImage Image; echo "KPM 修补完成"; fi
+
+      - name: 组装 AnyKernel3
+        id: pack
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC_ROOT"
+          IMG=$(ls out/android12-5.10/dist/Image 2>/dev/null || find out -maxdepth 6 -name Image -type f | head -1)
+          test -n "$IMG" || { echo "::error::编译成功但没有 Image"; ls -R out | tail -40; exit 1; }
+          AK="$GITHUB_WORKSPACE/AnyKernel3"
+          cp "$IMG" "$AK/Image"
+          file "$AK/Image"
+          file "$AK/Image" | grep -q 'Linux kernel' || { echo "::error::Image 类型不对"; exit 1; }
+
+          REL=$(strings "$AK/Image" | grep -m1 '^Linux version' | awk '{print $3}')
+          echo "Kernel release: $REL"
+          echo "release=$REL" >> $GITHUB_OUTPUT
+          echo "- uname -r: \`$REL\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "${{ inputs.variant }}" > "$AK/variant.txt"
+          NAME="K60-5.10-GKI-${REL}-${{ inputs.variant }}"
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          cd "$GITHUB_WORKSPACE"
+          (cd AnyKernel3 && zip -r9 "../${NAME}.zip" . -x '*.git*' >/dev/null)
+          ls -lh "${NAME}.zip"
+
+      - name: 上传刷机包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ github.workspace }}/${{ steps.pack.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: 保存 ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: k60-ccache-${{ env.BRANCH }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}-${{ github.run_id }}
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ github.workspace }}/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: inputs.upload_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/*.zip
+          tag: k60-${{ needs.build.outputs.kernel_release }}-${{ github.run_number }}
+          name: K60 GKI ${{ needs.build.outputs.kernel_release }}
+          body: |
+            内核：`${{ needs.build.outputs.kernel_release }}`
+            变体：`${{ inputs.variant }}`
+            manifest：`${{ inputs.os_patch_level }}`
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
